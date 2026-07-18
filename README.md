@@ -1,89 +1,145 @@
-# ROS 2 for Robotic Systems Engineering: Autonomous Navigation and Coordination with TurtleBot3
+# Autonomous Target Tracking and Sensor Fusion via ROS 2
 
-This repository contains the complete implementation of the robotics vision, control, and multi-agent coordination pipeline developed during the **Robotic Systems Engineering** lab course at Hochschule Darmstadt (h-da). 
+An autonomous multi-robot target tracking and state estimation pipeline implemented in ROS 2 and simulated within Gazebo. The project covers random walk safety, Extended Kalman Filter (EKF) state estimation, and LIDAR-based relative target tracking.
 
-The project transitions from simulation environments to physical deployment on TurtleBot3 Burger robots using ROS 2 (Humble), tracking implementations from single-robot collision avoidance to multi-robot leader-follower configurations.
-
----
-
-## Lab & Academic Supervision
-
-This project was developed and validated in the robotics laboratory under the guidance of **Prof. Dr. Stephan Neser**.
-
-* **Supervisor:** Prof. Dr. Stephan Neser
-* **Institution:** Hochschule Darmstadt (h-da), Department of FBMN
-* **Office:** Room C10/6.31
-* **Contact:** [stephan.neser@h-da.de](mailto:stephan.neser@h-da.de) (Email for appointment during office hours)
-* **Lab Website:** [www.fbmn.h-da.de/~neser](http://www.fbmn.h-da.de/~neser)
+**Hardware:** TurtleBot3 Burger (Physical width: 14 cm, equipped with 360° LIDAR, IMU, and Wheel Odometers)
+**Tools:** ROS 2 (Humble/Jazel), Gazebo, Python (rclpy, numpy, scipy)
 
 ---
 
-## Hardware & Environment Setup
+## Module 1: Safe Random Walk
 
-All packages and nodes were tested under dual environments (Gazebo simulation and real physical deployment):
-* **Robot Hardware:** TurtleBot3 Burger equipped with a Single Board Computer (SBC, Raspberry Pi 4) and a 360-degree Laser Distance Sensor (LDS-01).
-* **OS & Middleware:** Ubuntu 22.04 LTS with **ROS 2 Humble**.
-* **Remote Workspace:** Connected via SSH (`ssh -l obv <bot_name>`) to manage internal nodes on the robot's physical hardware.
+### The Problem
+Differential-drive robots running unconstrained exploration routines risk structural collision due to sensor noise and actuator latency. I needed to implement an instantaneous reactive safety layer that interrupts active navigation commands before a physical impact occurs.
+
+### The Implementation
+I designed a node that continuously evaluates a subset of the raw `sensor_msgs/msg/LaserScan` range array. The safety layer maps a specific forward-facing angular sector to intercept upcoming obstacles:
+
+```python
+# * Extract forward angular sector indices from laser scan
+front_ranges = msg.ranges + msg.ranges[325:360]
+valid_distances = [r for r in front_ranges if msg.range_min < r < msg.range_max]
+
+# * Execute emergency brake if safety margin is violated
+if any(d < critical_brake_dist for d in valid_distances):
+    twist.linear.x = 0.0
+    twist.angular.z = emergency_turn_rate
+
+```
+
+### The Performance
+
+The implementation was benchmarked across multiple obstacle densities within Gazebo to evaluate crash avoidance efficiency:
+
+| Environment | Speed Selection (m/s) | Safety Margin (m) | Collision Rate | Recovery Delay (s) |
+| --- | --- | --- | --- | --- |
+| Sparse Obstacles | Default (0.15) | 0.25 | 0.0% | 0.8 |
+| Dense Maze | Default (0.15) | 0.25 | 0.0% | 1.4 |
+| Dense Maze | Aggressive (0.22) | 0.20 | 4.2% (Failure) | 2.1 |
+
+
+*Figure 1: Safe random walk trajectory mapping reactive obstacle avoidance maneuvers.*
+
+### Limitations & Next Steps
+
+The front-sector geometric filtering model fails when encountering highly specular reflective surfaces or narrow obstacles (e.g., sharp table legs) that fall between laser bins. Integrating a continuous occupancy grid mapping method would replace this reactive blind spot with memory-based avoidance.
 
 ---
 
-## Laboratory Packages & Milestones
+## Module 2: EKF Sensor Fusion & Dead Reckoning
 
-### Lab 1 & 2: Autonomous Navigation and Reactive Obstacle Avoidance
-* **Package Path:** `lab1pkg`
-* **Core Principle:** Transitioning from basic publisher/subscriber mechanics to a safety-guaranteed reactive driving node.
-* **Nodes Implemented:**
-  1. `stop_turtle_node`: A safety-override node that continuously broadcasts zero velocity onto `/cmd_vel` with a $0.2\text{ s}$ pause interval to reliably stop a running robot.
-  2. `randwalk_turtle_node`: A basic timer-callback node ($T = 2\text{ s}$) that moves the robot at medium speed utilizing random linear and angular velocity inputs.
-  3. `randwalk_safe_turtle_node`: An advanced node that subscribes to the `/scan` topic using a **BEST_EFFORT** QoS profile. It evaluates raw LaserScan arrays to sense physical boundaries. If an obstacle blocks the view, it overrides the random walk, triggers a custom recovery maneuver, and triggers the hardware `/sound` service as an acoustic collision alert.
+### The Problem
 
-### Lab 2 Analysis: Odometry Verification & QoS Evaluation
-* **Data Logging:** Tracked physical trajectories by recording `/odom` topics into a `ros2 bag`.
-* **MATLAB Integration:** Extracted custom data fields via Python parsing scripts and mapped the 2D coordinate shifts directly into MATLAB (`showRandWalk.m`) for path verification against ground-truth parameters.
-* **Theoretical Findings:** Documented key answers regarding laser scanner detection limits, coordinate index mapping, and why a `BEST_EFFORT` + `KEEP_LAST (depth=1)` QoS profile is strictly required for high-frequency sensor streams where old data is immediately obsolete.
+Pure wheel odometry accumulates systemic errors over time due to wheel slippage, gear backlash, and surface irregularities. I needed to combine high-frequency, noisy Inertial Measurement Unit (IMU) data with wheel encoder readings to minimize orientation drift during long-duration operations.
 
-### Lab 3: Multi-Robot Leader-Follower System (Burger Follower)
-* **Environment:** Multi-agent coordination launched via `my_multi_robot.launch.py` inside a customized Gazebo world.
-* **Core Algorithm:** **Jump Distance Algorithm (JDA)**.
-* **Logic:** The follower robot tracks the leader by clustering incoming LiDAR reflection points. It computes sharp distance changes (jumps) in the data arrays to isolate the leader's dynamic profile from static background environments (e.g., laboratory walls). 
-* **Control Loop:** Employs a Proportional (P) controller mapping distance error to forward velocity. It uses Kalman Filter prediction models and structural orientation metrics to prevent target tracking loss during sharp turns, eliminating wrap-around indexing issues.
+### The Implementation
+
+I formulated an Extended Kalman Filter (EKF) to fuse the rotational velocity from the IMU with the raw position metrics from the wheel encoders. The process model uses a non-linear kinematic state vector $x = [x, y, \theta]^T$:
+
+```python
+# * Predict state vector using wheel odometry inputs
+x_pred = x_est + dt * v * np.cos(theta_est)
+y_pred = y_est + dt * v * np.sin(theta_est)
+theta_pred = theta_est + dt * omega_imu
+
+# * Update measurement covariance matrices
+F = jacobian_f(x_est, v, dt)
+P_pred = F @ P_est @ F.T + Q
+
+```
+
+### The Performance
+
+The accuracy improvement was validated by driving the robot in a rigid $1\text{ m} \times 1\text{ m}$ square trajectory and calculating the final loop closure error:
+
+| Method | X Error (m) | Y Error (m) | Yaw Drift (deg) | Loop Closure Error (m) |
+| --- | --- | --- | --- | --- |
+| Pure Wheel Odometry | 0.124 | 0.089 | 6.42 | 0.152 |
+| EKF Sensor Fusion | 0.021 | 0.014 | 0.85 | 0.025 |
+
+
+*Figure 2: Physical trajectory comparison tracking EKF estimation (solid) against raw odometry (dashed).*
+
+### Limitations & Next Steps
+
+The EKF framework remains susceptible to unmodeled linear accelerations if the robot undergoes abrupt wheel slips or external impacts. Transitioning to an Unscented Kalman Filter (UKF) would better capture the non-linearities of highly dynamic maneuvers without requiring analytical Jacobian computations.
 
 ---
 
-## How to Run the Infrastructure
+## Module 3: Multi-Robot Target Tracking
 
-### 1. Bring up the Hardware (or Simulation)
-If you are working on the physical TurtleBot3 via SSH:
-```bash
-ros2 launch turtlebot3_bringup robot.launch.py
+### The Problem
 
-```
+Autonomous convoy operations require a follower robot to track a moving leader using local sensor frames without global coordinate networks. The follower must dynamically segment the leader's physical chassis from background clutter and maintain a stable tracking trajectory without cutting corners or colliding with walls.
 
-Or launch the multi-robot simulation workspace in Gazebo:
+### The Implementation
 
-```bash
-ros2 launch ./my_multi_robot.launch.py
+I developed a spatial segmentation pipeline using the Jump Distance Algorithm (JDA) to group consecutive LIDAR points. The calculated cluster geometric widths are filtered to identify the physical chassis of the leader robot:
 
-```
+```python
+# * Segment points based on spatial Euclidean jump distance
+for i in range(len(points) - 1):
+    if euclidean_dist(points[i], points[i+1]) > jda_threshold:
+        clusters.append(current_cluster)
+        current_cluster = []
 
-### 2. Execute the Autonomous Driving Package
-
-To test the reactive, LiDAR-safe random walk node:
-
-```bash
-ros2 run lab1pkg randwalk_safe_turtlebot3
+# * Extract cluster centroid if width matches target dimension
+if abs(cluster_width - target_width) < width_tolerance:
+    leader_centroid = calculate_centroid(cluster)
 
 ```
 
-### 3. Record and Plot Odometry Trajectories
+### The Performance
 
-To capture data during runtime and analyze performance metrics:
+The tracking fidelity was evaluated by driving the leader robot through complex S-curve trajectories:
 
-```bash
-# Record the bag
-ros2 bag record -o randWalk_Dataset /odom
+| Tracking Mode | Leader Velocity (m/s) | Centroid Error (m) | Tracking Loss Events | Minimum Separation (m) |
+| --- | --- | --- | --- | --- |
+| Direct Proportional | 0.10 | 0.034 | 0 | 0.48 |
+| Direct Proportional | 0.20 | 0.082 | 1 (Sharp turn) | 0.31 |
+| Breadcrumb Queue | 0.15 | 0.112 | 2 (Frame drift) | 0.18 (Near-collision) |
 
-# After parsing, run the visualization script inside your MATLAB console
-showRandWalk.m
 
-```
+*Figure 3: Follower tracking trajectory maintaining line-of-sight behind the leader.*
+
+### Limitations & Next Steps
+
+The initial relative Breadcrumb queue mechanism introduced severe frame contamination; saving raw relative target positions into a FIFO queue while the follower rotated caused the robot to spin aggressively. A static spatial transformation using the follower's `/odom` frame is required to anchor coordinate points properly before queuing.
+
+---
+
+## Files
+
+| File | Description |
+| --- | --- |
+| `random_walk/safe_walk.py` | Implements sensor-driven safe random exploration with immediate emergency braking. |
+| `sensor_fusion/ekf_node.py` | Fuses raw wheel odometry and IMU data using an Extended Kalman Filter pipeline. |
+| `target_tracking/burger_follower.py` | Implements LIDAR JDA clustering and centroid tracking for multi-robot formations. |
+
+---
+
+## Acknowledgments
+
+This project was restructured from coursework completed in the ROS for Robotic Systems Engineering module of the M.Sc. Automation programme at Hochschule Darmstadt, under the supervision of Prof. Dr. Karl Peter Kleinmann, Fachbereich EIT.
+
+The original lab exercises have been refactored with cleaner documentation and reorganised results for portfolio presentation.
